@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  TargetEnvironment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+  stackName:
+    Type: String
+    Default: ecs-cluster-image-repo
+  AccessTokenValidity: #Cannot be more than the refresh token
+    Type: Number
+    Default: 1
+  IdTokenValidity: #Cannot be more than the refresh token
+    Type: Number
+    Default: 1
+  RefreshTokenValidity:
+    Type: Number
+    Default: 365
+  AccessTokenValidityUnits:
+    Type: String
+    Default: days
+  IdTokenValidityUnits:
+    Type: String
+    Default: days
+  RefreshTokenValidityUnits:
+    Type: String
+    Default: days
+  #DomainName:
+  #  Type: String
+  #  Default: https://abc.com
+  #DomainPort:
+  #  Type: String
+  #  Default: "80"
+
+Resources:
+  Repo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref stackName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - "ecr:*"
+
+  APICognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${stackName}-UserPool"
+      AutoVerifiedAttributes: 
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+      AliasAttributes:
+        - email
+        - preferred_username
+      Schema:
+        - AttributeDataType: String
+          Name: email
+          Required: true
+
+  APICognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${stackName}-UserPoolClient"
+      UserPoolId: !Ref APICognitoUserPool
+      GenerateSecret: true
+      AccessTokenValidity: !Ref AccessTokenValidity
+      IdTokenValidity: !Ref IdTokenValidity
+      RefreshTokenValidity: !Ref RefreshTokenValidity
+      TokenValidityUnits:
+        AccessToken: !Ref AccessTokenValidityUnits
+        IdToken: !Ref IdTokenValidityUnits
+        RefreshToken: !Ref RefreshTokenValidityUnits
+      ExplicitAuthFlows:
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      ReadAttributes:
+        - email
+        - name
+      WriteAttributes:
+        - email
+        - name
+      ## OAuth support - hosted UI
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - http://localhost:80/api/auth/callback/cognito
+        - http://localhost/api/auth/callback/cognito
+        - http://localhost:3030/api/auth/callback/cognito
+        - http://localhost:8080/api/auth/callback/cognito
+        - http://localhost:8081/api/auth/callback/cognito
+        #- !Sub "http://${DomainName}:${DomainPort}/api/auth/callback/cognito"
+        #- !Sub "http://${DomainName}/api/auth/callback/cognito"
+      LogoutURLs:
+        - http://localhost:80/api/auth/callback/cognito
+        - http://localhost/api/auth/callback/cognito
+        - http://localhost:3030/api/auth/callback/cognito
+        - http://localhost:8080/api/auth/callback/cognito
+        - http://localhost:8081/api/auth/callback/cognito
+        #- !Sub "http://${DomainName}:${DomainPort}/api/auth/callback/cognito"
+        #- !Sub "http://${DomainName}/api/auth/callback/cognito"
+      AllowedOAuthScopes:
+        - aws.cognito.signin.user.admin
+        - email
+        - openid
+        - phone
+        - profile
+      AllowedOAuthFlows: 
+        - code
+        - implicit
+      AllowedOAuthFlowsUserPoolClient: True
+  
+  APICognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref APICognitoUserPool 
+      Domain: !Sub "${stackName}-domain"
+
+  UserPoolResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref APICognitoUserPool
+      Identifier: !Sub "https://${stackName}.com"
+      Name: !Sub "${stackName}-userPoolServer"
+
+Outputs:
+# Do not change names of the variables - these are used by CI job.
+# All outputs are compiled to a .env file with all names appended with "REACT_APP_" for the docker website
+  repoURI:
+    Value: !GetAtt Repo.RepositoryUri
+  repoName:
+    Value: !Select [1, !Split ['/', !Select [5, !Split [':', !GetAtt Repo.Arn]]]] #docker-image-ecr-repo
+  primaryDomain:
+    Value: http://localhost:8081
+  #primaryDomain:
+  #  Value: !Sub "http://${DomainName}:${DomainPort}"
+  cognitoUserPoolId:
+    Value: !Ref APICognitoUserPool
+  cognitoClientId:
+    Value: !Ref APICognitoUserPoolClient
+  cognitoIssuer:
+    Value: !Join ['', [!Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/", !Ref APICognitoUserPool]]

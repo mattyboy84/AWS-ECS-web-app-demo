@@ -1,0 +1,67 @@
+image: amazon/aws-sam-cli-build-image-nodejs14.x:latest
+ 
+stages:
+  - deploy
+  - restartAllTasks
+  - stopAllTasks
+  - startOneTask
+
+variables:
+  STACK_NAME: ecs-cluster
+  REGION: eu-west-2
+
+before_script:
+  - set AWS_ACCESS_KEY_ID=$prod_key_id
+  - set AWS_SECRET_ACCESS_KEY=$prod_secret_key
+
+deploy:
+  image: amazon/aws-sam-cli-build-image-nodejs14.x:latest
+  stage: deploy
+  script: 
+   - sam build
+   - sam package --output-template-file packaged.yaml --s3-bucket gitlab-codebucket --region $REGION
+   - sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket gitlab-codebucket --capabilities CAPABILITY_NAMED_IAM --region $REGION
+
+restartAllTasks:
+  image: alpine:latest
+  stage: restartAllTasks
+  before_script:
+    - apk add --no-cache aws-cli
+    - CLUSTER_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='clusterName'].OutputValue" --output text)
+    - SERVICE_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='serviceName'].OutputValue" --output text)
+  script:
+    - TASKS=$(aws ecs list-tasks --cluster $CLUSTER_NAME --service $SERVICE_NAME --region $REGION --query taskArns --desired-status RUNNING | wc -l)
+    - TASKS=$(expr $TASKS - 2)
+    - echo $TASKS
+    - aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --region $REGION --force-new-deployment --desired-count $TASKS
+  when: manual
+  dependencies:
+    - deploy
+
+stopAllTasks:
+  image: alpine:latest
+  stage: stopAllTasks
+  before_script:
+    - apk add --no-cache aws-cli
+    - CLUSTER_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='clusterName'].OutputValue" --output text)
+    - SERVICE_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='serviceName'].OutputValue" --output text)
+  script:
+    - aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --region $REGION --desired-count 0
+  when: manual
+  dependencies:
+    - deploy
+
+startOneTask:
+  image: alpine:latest
+  stage: startOneTask
+  before_script:
+    - apk add --no-cache aws-cli
+    - CLUSTER_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='clusterName'].OutputValue" --output text)
+    - SERVICE_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='serviceName'].OutputValue" --output text)
+  script:
+    - aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --region $REGION --force-new-deployment --desired-count 1
+  when: manual
+  dependencies:
+    - deploy
+
+#--no-execute-changeset

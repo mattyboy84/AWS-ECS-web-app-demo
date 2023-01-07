@@ -1,0 +1,95 @@
+image: amazon/aws-sam-cli-build-image-nodejs14.x:latest
+ 
+stages:
+  - deploy
+  - deployDockerImage
+  - envs
+
+variables:
+  STACK_NAME: ecs-cluster-image-repo
+  REGION: eu-west-2
+
+before_script:
+  - set AWS_ACCESS_KEY_ID=$prod_key_id
+  - set AWS_SECRET_ACCESS_KEY=$prod_secret_key
+
+deploy:
+  image: amazon/aws-sam-cli-build-image-nodejs14.x:latest
+  stage: deploy
+  script:
+   - sam build
+   - sam package --output-template-file packaged.yaml --s3-bucket gitlab-codebucket --region $REGION
+   - sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket gitlab-codebucket --capabilities CAPABILITY_NAMED_IAM --region $REGION
+
+deployDockerImage:
+  image: docker:latest
+  stage: deployDockerImage
+
+  services:
+    - docker:20.10.16-dind
+  
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+
+  before_script:
+    - apk add --no-cache aws-cli
+    - apk add jq
+    # ids are needed to access scopes & token
+    - COGNITO_CLIENT_ID=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='cognitoClientId'].OutputValue" --output text)
+    - COGNITO_USER_POOL_ID=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='cognitoUserPoolId'].OutputValue" --output text)
+    
+    - COGNITO_USER_POOL_SECRET=$(aws cognito-idp --region $REGION describe-user-pool-client --client-id $COGNITO_CLIENT_ID --user-pool-id $COGNITO_USER_POOL_ID --query UserPoolClient.ClientSecret --output text)
+    - COGNITO_USER_POOL_SCOPES=$(aws cognito-idp --region $REGION describe-user-pool-client --client-id $COGNITO_CLIENT_ID --user-pool-id $COGNITO_USER_POOL_ID --query UserPoolClient.AllowedOAuthScopes --output text)
+    # domain is needed for nextjs config
+    - DOMAIN=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='primaryDomain'].OutputValue" --output text)
+    #
+    - sh scripts/envs.sh $STACK_NAME $REGION
+    #
+    - echo "NEXTAUTH_URL=${DOMAIN}" >> .env
+    - echo "NEXT_PUBLIC_cognitoClientSecret=${COGNITO_USER_POOL_SECRET}" >> .env
+    - echo "NEXT_PUBLIC_cognitoClientScopes=${COGNITO_USER_POOL_SCOPES}" >> .env
+    #
+  script:
+    - REPOSITORY_URI=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='repoURI'].OutputValue" --output text)
+    - REPOSITORY_NAME=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='repoName'].OutputValue" --output text)
+     #
+    - aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
+    - docker build -t $REPOSITORY_NAME .
+    - docker tag $REPOSITORY_NAME:latest $REPOSITORY_URI:latest
+    - docker push $REPOSITORY_URI:latest
+  when: manual
+  dependencies:
+    - deploy
+  artifacts:
+    paths:
+      - .env
+
+envs:
+  image: alpine:latest
+  stage: envs
+
+  script:
+    - apk add --no-cache aws-cli
+    - apk add jq
+    # ids are needed to access scopes & token
+    - COGNITO_CLIENT_ID=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='cognitoClientId'].OutputValue" --output text)
+    - COGNITO_USER_POOL_ID=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='cognitoUserPoolId'].OutputValue" --output text)
+    
+    - COGNITO_USER_POOL_SECRET=$(aws cognito-idp --region $REGION describe-user-pool-client --client-id $COGNITO_CLIENT_ID --user-pool-id $COGNITO_USER_POOL_ID --query UserPoolClient.ClientSecret --output text)
+    - COGNITO_USER_POOL_SCOPES=$(aws cognito-idp --region $REGION describe-user-pool-client --client-id $COGNITO_CLIENT_ID --user-pool-id $COGNITO_USER_POOL_ID --query UserPoolClient.AllowedOAuthScopes --output text)
+    # domain is needed for nextjs config
+    - DOMAIN=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='primaryDomain'].OutputValue" --output text)
+    #
+    - sh scripts/envs.sh $STACK_NAME $REGION
+    #
+    - echo "NEXTAUTH_URL=${DOMAIN}" >> .env
+    - echo "NEXT_PUBLIC_cognitoClientSecret=${COGNITO_USER_POOL_SECRET}" >> .env
+    - echo "NEXT_PUBLIC_cognitoClientScopes=${COGNITO_USER_POOL_SCOPES}" >> .env
+    #
+  when: manual
+  dependencies:
+    - deploy
+  artifacts:
+    paths:
+      - .env

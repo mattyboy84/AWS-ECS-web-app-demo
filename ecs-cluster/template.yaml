@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  TargetEnvironment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+  stackName:
+    Type: String
+    Default: ecs-cluster
+  clusterName:
+    Type: String
+    Default: ecs-cluster-test-cluster
+  containerName:
+    Type: String
+    Default: ecs-cluster-container
+  imageRepoName:
+    Type: String
+    Default: ecs-cluster-image-repo
+    Description: name of external ECR repo to pull latest image from
+ 
+Resources:
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${stackName}-ECSRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - ecs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${stackName}-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "ecs:*"
+                Resource: "*"
+              - Effect: Allow
+                Action: "ec2:*"
+                Resource: "*"
+              - Effect: Allow
+                Action: "ecr:*"
+                Resource: "*"
+              - Effect: Allow
+                Action: "elasticloadbalancing:*"
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  scalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${stackName}-scalingRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - application-autoscaling.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${stackName}-ecsAutoScalePolicy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: !Join
+                  - ''
+                  - - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:"
+                    - !Ref cluster
+                    - /
+                    - !GetAtt service.Name
+
+  cluster:
+    Type: AWS::ECS::Cluster
+    Properties: 
+      ClusterName: !Ref clusterName
+      CapacityProviders: 
+        - FARGATE
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled # This creats a log group that is published to. It also exists beyond the stack being deleted
+
+  service:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      Cluster: !GetAtt cluster.Arn
+      ServiceName: !Sub "${stackName}-test-service"
+      DesiredCount: 1
+      PlatformVersion: "1.3.0"
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: false
+          Rollback: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref myClusterSecurityGroup
+          Subnets:
+            - !Ref subnetA
+            - !Ref subnetB
+      LoadBalancers:
+        -
+          ContainerName: !Ref containerName
+          ContainerPort: 8081
+          TargetGroupArn: !Ref targetGroup
+    DependsOn:
+      - loadBalancer
+ 
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ExecutionRoleArn: !GetAtt ECSRole.Arn
+      TaskRoleArn: !GetAtt ECSRole.Arn
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "512"
+      Memory: "1024"
+      ContainerDefinitions:
+        - 
+          Name: !Ref containerName
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${imageRepoName}:latest"
+          PortMappings:
+            - ContainerPort: 8081
+              HostPort: 8081
+              Protocol: tcp
+          Essential: true
+          Cpu: 512
+          Memory: 1024
+          #HealthCheck:
+          #  Command:
+          #      - "CMD-SHELL"
+          #      - "echo hello"
+          #  Interval: 5
+          #  Retries: 2
+          #  Timeout: 3
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-group: !Ref containerLogs
+              awslogs-stream-prefix: "prefix"
+
+  containerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - ''
+        - - /aws/ecs/
+          - !Sub "${containerName}-logs"
+
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref MyVPC
+
+  subnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Sub "${AWS::Region}a" # eu-west-2a
+      VpcId: !Ref MyVPC
+      MapPublicIpOnLaunch: true
+
+  subnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Sub "${AWS::Region}b" # eu-west-2b
+      VpcId: !Ref MyVPC
+      MapPublicIpOnLaunch: true
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+
+  subnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref subnetA
+
+  subnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref subnetB
+ 
+  myClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub "${stackName}-myClusterSecurityGroup description"
+      GroupName: !Sub "${stackName}-myClusterSecurityGroup"
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - FromPort: 8081
+          ToPort: 8081
+          IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+
+  myLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub "${stackName}-myLoadBalancerSecurityGroup description"
+      GroupName: !Sub "${stackName}-myLoadBalancerSecurityGroup"
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+        - FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+          CidrIpv6: ::/0
+ 
+  loadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: 
+      Name: !Sub "${stackName}-LB"
+      IpAddressType: ipv4
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: 
+        - !Ref myLoadBalancerSecurityGroup
+      Subnets:
+        - !Ref subnetA
+        - !Ref subnetB
+
+  HTTPlistener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: 
+        - Type: forward
+          TargetGroupArn: !Ref targetGroup
+      LoadBalancerArn: !Ref loadBalancer
+
+  targetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      Name: !Sub "${stackName}-LB-targetGroup"
+      TargetType: ip
+      IpAddressType: ipv4
+      Port: 8081
+      Protocol: HTTP
+      ProtocolVersion: HTTP1
+      VpcId: !Ref MyVPC
+      HealthCheckEnabled: true
+
+# SCALING ###########
+
+  serviceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 2
+      MinCapacity: 1
+      ResourceId: !Join
+        - /
+        - - service
+          - !Ref cluster
+          - !GetAtt service.Name
+      RoleARN: !GetAtt scalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  serviceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${stackName}-service-scaleCPU-policy"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref serviceScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        #Above 70% CPU - scale up
+        #Below 70% CPU - scale down
+        TargetValue: 70
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification: 
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+#Add cloudwatch alarm to template
+
+# OUTPUTS ###########
+
+Outputs:
+  DNSname:
+    Value: !GetAtt loadBalancer.DNSName
+  clusterName:
+    Value: !Ref cluster
+  serviceName:
+    Value: !GetAtt service.Name
